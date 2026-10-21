@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Spatial Hash Grid Visualization</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; color: #eee; font-family: monospace; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+    h1 { margin-bottom: 10px; font-size: 18px; color: #e94560; }
+    .main { display: flex; gap: 16px; align-items: flex-start; }
+    .side-panel { display: flex; flex-direction: column; gap: 12px; width: 220px; }
+    .panel { background: #16213e; border: 1px solid #333; border-radius: 6px; padding: 10px; }
+    .panel h2 { font-size: 13px; color: #e94560; margin-bottom: 6px; border-bottom: 1px solid #333; padding-bottom: 4px; }
+    .panel-list { max-height: 220px; overflow-y: auto; font-size: 11px; line-height: 1.7; }
+    .panel-list .row { display: flex; justify-content: space-between; padding: 1px 4px; border-radius: 3px; }
+    .panel-list .row:nth-child(odd) { background: rgba(255,255,255,0.03); }
+    .panel-list .header { color: #888; font-weight: bold; border-bottom: 1px solid #333; margin-bottom: 2px; }
+    canvas { border: 1px solid #333; cursor: crosshair; }
+    .info { margin-top: 10px; font-size: 12px; color: #888; max-width: 900px; text-align: center; }
+    .legend { display: flex; gap: 18px; margin-top: 8px; font-size: 12px; }
+    .legend span { display: flex; align-items: center; gap: 4px; }
+    .legend .swatch { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+    .start-index-cell { display: inline-flex; flex-direction: column; align-items: center; justify-content: center;
+      min-width: 48px; padding: 3px 5px; border-radius: 4px; border: 1px solid #333; font-size: 10px; line-height: 1.4; }
+    .start-index-cell .start-index-key { color: #888; }
+    .start-index-cell .start-index-value { font-weight: bold; }
+    .start-index-cell.empty { opacity: 0.3; }
+    .start-index-cell.occupied { background: rgba(255,255,255,0.05); }
+    .start-index-cell.highlighted { border-color: #e94560; background: rgba(233,69,96,0.15); }
+    .controls { margin-bottom: 12px; display: flex; gap: 16px; align-items: center; }
+    .controls button { background: #e94560; border: none; color: #fff; padding: 6px 14px; cursor: pointer; border-radius: 4px; font-family: monospace; }
+    .controls button:hover { background: #c73650; }
+    .controls label { font-size: 13px; display: flex; align-items: center; gap: 6px; }
+    .controls input[type=range] { width: 120px; }
+  </style>
+</head>
+<body>
+  <h1>Spatial Hash Grid — optimization.rs</h1>
+  <div class="controls">
+    <label>Radius: <input type="range" id="radiusSlider" min="20" max="200" value="100"> <span id="radiusVal">100</span></label>
+    <button id="shuffle">Shuffle</button>
+  </div>
+  <div class="main">
+    <div class="side-panel">
+      <div class="panel">
+        <h2>particle_indexes[] (sorted)</h2>
+        <div class="panel-list" id="particleIndexesList"></div>
+      </div>
+    </div>
+    <canvas id="gridCanvas" width="600" height="400"></canvas>
+    <div class="side-panel">
+      <div class="panel">
+        <h2>keys[] (sorted)</h2>
+        <div class="panel-list" id="cellKeysList"></div>
+      </div>
+    </div>
+  </div>
+  <div class="panel" style="margin-top: 12px; max-width: 900px; width: 100%;">
+    <h2>start_indexes[] — cell → first sorted index</h2>
+    <div class="panel-list" id="startIndexesList" style="max-height: 160px; display: flex; flex-wrap: wrap; gap: 2px;"></div>
+  </div>
+  <div class="legend">
+    <span><span class="swatch" style="background:#4fc3f7"></span> Particle</span>
+    <span><span class="swatch" style="background:#e94560"></span> Hovered cell</span>
+    <span><span class="swatch" style="background:rgba(255,193,7,0.25)"></span> Neighbor cells</span>
+  </div>
+  <div class="info">Hover over a cell to highlight its 3x3 neighbor region. Cell size = 2 &times; DENSITY_RADIUS.</div>
+
+<script>
+const EMPTY_CELL_SENTINEL = 0xFFFFFFFF;
+const PARTICLE_COUNT = 25;
+const PARTICLE_RADIUS_DEFAULT = 5;
+const PARTICLE_RADIUS_HIGHLIGHTED = 7;
+const EDGE_PADDING_IN_PIXELS = 20;
+const CELL_LABEL_FONT = '11px monospace';
+const PARTICLE_INDEX_FONT = '9px monospace';
+const CELL_KEY_LABEL_OFFSET_X = 4;
+const CELL_KEY_LABEL_OFFSET_Y = 14;
+const START_INDEX_LABEL_OFFSET_Y = 28;
+const PARTICLE_LABEL_OFFSET_X = 7;
+const PARTICLE_LABEL_OFFSET_Y = -4;
+
+const CELL_PALETTE = [
+  '#4fc3f7', '#81c784', '#ffb74d', '#ba68c8', '#e57373',
+  '#4dd0e1', '#aed581', '#ff8a65', '#9575cd', '#f06292',
+];
+
+const gridCanvas = document.getElementById('gridCanvas');
+const canvasContext = gridCanvas.getContext('2d');
+const canvasWidth = gridCanvas.width;
+const canvasHeight = gridCanvas.height;
+
+let densityRadius = 100.0;
+let cellSize = densityRadius * 2;
+let hoveredCellKey = null;
+let particlePositions = [];
+let grid = null;
+let startIndexElements = [];
+
+// --- Mirror of optimization.rs: Grid struct and functions ---
+// Field names match the Rust struct: cell_size, grid_size, particle_indexes, keys, start_indexes
+
+function createGrid(windowSize, cellSize, positions) {
+  const gridColumnCount = Math.ceil(windowSize[0] / cellSize);
+  const gridRowCount = Math.ceil(windowSize[1] / cellSize);
+  const particleCount = positions.length;
+  const totalCellCount = gridColumnCount * gridRowCount;
+
+  return {
+    cell_size: cellSize,
+    grid_size: [gridColumnCount, gridRowCount],
+    particle_indexes: Array.from({ length: particleCount }, (_, index) => index),
+    keys: new Array(particleCount).fill(0),
+    start_indexes: new Array(totalCellCount).fill(EMPTY_CELL_SENTINEL),
+  };
+}
+
+function createCellKey(grid, positions) {
+  for (let particleIndex = 0; particleIndex < positions.length; particleIndex++) {
+    const cellX = Math.min(
+      Math.floor(positions[particleIndex][0] / grid.cell_size),
+      grid.grid_size[0] - 1
+    );
+    const cellY = Math.min(
+      Math.floor(positions[particleIndex][1] / grid.cell_size),
+      grid.grid_size[1] - 1
+    );
+    grid.keys[particleIndex] = cellY * grid.grid_size[0] + cellX;
+  }
+}
+
+function sortKeys(grid) {
+  const particleKeyPairs = grid.particle_indexes.map(
+    (particleIndex, sortedPosition) => [particleIndex, grid.keys[sortedPosition]]
+  );
+
+  particleKeyPairs.sort((first, second) => first[1] - second[1]);
+
+  for (let sortedIndex = 0; sortedIndex < particleKeyPairs.length; sortedIndex++) {
+    grid.particle_indexes[sortedIndex] = particleKeyPairs[sortedIndex][0];
+    grid.keys[sortedIndex] = particleKeyPairs[sortedIndex][1];
+  }
+
+  grid.start_indexes.fill(EMPTY_CELL_SENTINEL);
+  for (let sortedIndex = 0; sortedIndex < grid.keys.length; sortedIndex++) {
+    const cellKey = grid.keys[sortedIndex];
+    const isFirstOccurrenceOfKey = sortedIndex === 0 || grid.keys[sortedIndex - 1] !== cellKey;
+    if (isFirstOccurrenceOfKey) {
+      grid.start_indexes[cellKey] = sortedIndex;
+    }
+  }
+}
+
+// --- State management ---
+
+function generateRandomParticlePositions() {
+  particlePositions = [];
+  for (let index = 0; index < PARTICLE_COUNT; index++) {
+    const positionX = Math.random() * (canvasWidth - EDGE_PADDING_IN_PIXELS) + EDGE_PADDING_IN_PIXELS / 2;
+    const positionY = Math.random() * (canvasHeight - EDGE_PADDING_IN_PIXELS) + EDGE_PADDING_IN_PIXELS / 2;
+    particlePositions.push([positionX, positionY]);
+  }
+  rebuildGrid();
+}
+
+function rebuildGrid() {
+  grid = createGrid([canvasWidth, canvasHeight], cellSize, particlePositions);
+  createCellKey(grid, particlePositions);
+  sortKeys(grid);
+  updateAllPanelLists();
+}
+
+// --- Color helpers ---
+
+function getColorForCellKey(cellKey) {
+  return CELL_PALETTE[cellKey % CELL_PALETTE.length];
+}
+
+function isWithinNeighborRange(cellColumn, cellRow, hoveredColumn, hoveredRow) {
+  return Math.abs(cellColumn - hoveredColumn) <= 1 && Math.abs(cellRow - hoveredRow) <= 1;
+}
+
+function getCellCoordinatesFromKey(cellKey, gridColumnCount) {
+  const column = cellKey % gridColumnCount;
+  const row = Math.floor(cellKey / gridColumnCount);
+  return [column, row];
+}
+
+// --- Side panel list updates ---
+
+function buildParticleIndexesListHtml() {
+  let listHtml = '<div class="row header"><span>index</span><span>particle</span></div>';
+
+  for (let sortedIndex = 0; sortedIndex < grid.particle_indexes.length; sortedIndex++) {
+    const particleIndex = grid.particle_indexes[sortedIndex];
+    const cellKey = grid.keys[sortedIndex];
+    const color = getColorForCellKey(cellKey);
+    listHtml += `<div class="row"><span style="color:#888">${sortedIndex}</span><span style="color:${color}">${particleIndex}</span></div>`;
+  }
+
+  return listHtml;
+}
+
+function buildCellKeysListHtml() {
+  let listHtml = '<div class="row header"><span>index</span><span>key</span></div>';
+
+  for (let sortedIndex = 0; sortedIndex < grid.keys.length; sortedIndex++) {
+    const cellKey = grid.keys[sortedIndex];
+    const color = getColorForCellKey(cellKey);
+    listHtml += `<div class="row"><span style="color:#888">${sortedIndex}</span><span style="color:${color}">${cellKey}</span></div>`;
+  }
+
+  return listHtml;
+}
+
+function buildStartIndexesListHtml() {
+  const totalCellCount = grid.grid_size[0] * grid.grid_size[1];
+  let listHtml = '';
+
+  for (let cellKey = 0; cellKey < totalCellCount; cellKey++) {
+    const startIndex = grid.start_indexes[cellKey];
+    const isCellOccupied = startIndex !== EMPTY_CELL_SENTINEL;
+    const cssClass = isCellOccupied ? 'start-index-cell occupied' : 'start-index-cell empty';
+    const displayValue = isCellOccupied ? startIndex : '—';
+    const valueColor = isCellOccupied ? getColorForCellKey(cellKey) : '#555';
+    listHtml += `<div class="${cssClass}" data-key="${cellKey}"><span class="start-index-key">cell ${cellKey}</span><span class="start-index-value" style="color:${valueColor}">${displayValue}</span></div>`;
+  }
+
+  return listHtml;
+}
+
+function updateAllPanelLists() {
+  document.getElementById('particleIndexesList').innerHTML = buildParticleIndexesListHtml();
+  document.getElementById('cellKeysList').innerHTML = buildCellKeysListHtml();
+  document.getElementById('startIndexesList').innerHTML = buildStartIndexesListHtml();
+  startIndexElements = Array.from(document.querySelectorAll('#startIndexesList .start-index-cell'));
+}
+
+// --- Canvas drawing ---
+
+function drawNeighborHighlight(gridColumnCount, gridRowCount) {
+  if (hoveredCellKey === null) return;
+
+  const [hoveredColumn, hoveredRow] = getCellCoordinatesFromKey(hoveredCellKey, gridColumnCount);
+
+  for (let rowOffset = -1; rowOffset <= 1; rowOffset++) {
+    for (let columnOffset = -1; columnOffset <= 1; columnOffset++) {
+      const neighborColumn = hoveredColumn + columnOffset;
+      const neighborRow = hoveredRow + rowOffset;
+      const isInsideGrid = neighborColumn >= 0 && neighborColumn < gridColumnCount
+                        && neighborRow >= 0 && neighborRow < gridRowCount;
+
+      if (!isInsideGrid) continue;
+
+      const isHoveredCell = columnOffset === 0 && rowOffset === 0;
+      canvasContext.fillStyle = isHoveredCell ? 'rgba(233,69,96,0.18)' : 'rgba(255,193,7,0.12)';
+      canvasContext.fillRect(neighborColumn * cellSize, neighborRow * cellSize, cellSize, cellSize);
+    }
+  }
+}
+
+function drawGridLines(gridColumnCount, gridRowCount) {
+  canvasContext.strokeStyle = '#333';
+  canvasContext.lineWidth = 1;
+
+  for (let column = 0; column <= gridColumnCount; column++) {
+    canvasContext.beginPath();
+    canvasContext.moveTo(column * cellSize, 0);
+    canvasContext.lineTo(column * cellSize, gridRowCount * cellSize);
+    canvasContext.stroke();
+  }
+
+  for (let row = 0; row <= gridRowCount; row++) {
+    canvasContext.beginPath();
+    canvasContext.moveTo(0, row * cellSize);
+    canvasContext.lineTo(gridColumnCount * cellSize, row * cellSize);
+    canvasContext.stroke();
+  }
+}
+
+function drawCellLabels(gridColumnCount, gridRowCount) {
+  canvasContext.font = CELL_LABEL_FONT;
+
+  for (let row = 0; row < gridRowCount; row++) {
+    for (let column = 0; column < gridColumnCount; column++) {
+      const cellKey = row * gridColumnCount + column;
+      const startIndex = grid.start_indexes[cellKey];
+      const labelX = column * cellSize + CELL_KEY_LABEL_OFFSET_X;
+
+      canvasContext.fillStyle = '#444';
+      canvasContext.fillText(`k:${cellKey}`, labelX, row * cellSize + CELL_KEY_LABEL_OFFSET_Y);
+
+      const isCellOccupied = startIndex !== EMPTY_CELL_SENTINEL;
+      if (isCellOccupied) {
+        canvasContext.fillStyle = '#666';
+        canvasContext.fillText(`si:${startIndex}`, labelX, row * cellSize + START_INDEX_LABEL_OFFSET_Y);
+      }
+    }
+  }
+}
+
+function drawParticle(particleIndex, gridColumnCount, gridRowCount) {
+  const [positionX, positionY] = particlePositions[particleIndex];
+  const cellColumn = Math.min(Math.floor(positionX / cellSize), gridColumnCount - 1);
+  const cellRow = Math.min(Math.floor(positionY / cellSize), gridRowCount - 1);
+  const cellKey = cellRow * gridColumnCount + cellColumn;
+  const color = getColorForCellKey(cellKey);
+
+  let isHighlighted = false;
+  if (hoveredCellKey !== null) {
+    const [hoveredColumn, hoveredRow] = getCellCoordinatesFromKey(hoveredCellKey, gridColumnCount);
+    isHighlighted = isWithinNeighborRange(cellColumn, cellRow, hoveredColumn, hoveredRow);
+  }
+
+  canvasContext.beginPath();
+  canvasContext.arc(positionX, positionY, densityRadius, 0, Math.PI * 2);
+  canvasContext.strokeStyle = isHighlighted ? 'rgba(255,255,255,0.2)' : `${color}33`;
+  canvasContext.lineWidth = 1;
+  canvasContext.stroke();
+
+  const dotRadius = isHighlighted ? PARTICLE_RADIUS_HIGHLIGHTED : PARTICLE_RADIUS_DEFAULT;
+  canvasContext.beginPath();
+  canvasContext.arc(positionX, positionY, dotRadius, 0, Math.PI * 2);
+  canvasContext.fillStyle = isHighlighted ? '#fff' : color;
+  canvasContext.fill();
+
+  if (isHighlighted) {
+    canvasContext.strokeStyle = color;
+    canvasContext.lineWidth = 2;
+    canvasContext.stroke();
+  }
+
+  canvasContext.fillStyle = '#aaa';
+  canvasContext.font = PARTICLE_INDEX_FONT;
+  canvasContext.fillText(
+    `${particleIndex}`,
+    positionX + PARTICLE_LABEL_OFFSET_X,
+    positionY + PARTICLE_LABEL_OFFSET_Y
+  );
+}
+
+function drawHoveredCellBorder(gridColumnCount) {
+  if (hoveredCellKey === null) return;
+
+  const [hoveredColumn, hoveredRow] = getCellCoordinatesFromKey(hoveredCellKey, gridColumnCount);
+  canvasContext.strokeStyle = '#e94560';
+  canvasContext.lineWidth = 2;
+  canvasContext.strokeRect(hoveredColumn * cellSize, hoveredRow * cellSize, cellSize, cellSize);
+}
+
+function updateStartIndexPanelHighlights(gridColumnCount) {
+  for (const element of startIndexElements) {
+    const cellKey = +element.dataset.key;
+
+    if (hoveredCellKey === null) {
+      element.classList.remove('highlighted');
+      continue;
+    }
+
+    const [hoveredColumn, hoveredRow] = getCellCoordinatesFromKey(hoveredCellKey, gridColumnCount);
+    const [cellColumn, cellRow] = getCellCoordinatesFromKey(cellKey, gridColumnCount);
+    const isNeighbor = isWithinNeighborRange(cellColumn, cellRow, hoveredColumn, hoveredRow);
+
+    element.classList.toggle('highlighted', isNeighbor);
+  }
+}
+
+function draw() {
+  canvasContext.clearRect(0, 0, canvasWidth, canvasHeight);
+  const [gridColumnCount, gridRowCount] = grid.grid_size;
+
+  drawNeighborHighlight(gridColumnCount, gridRowCount);
+  drawGridLines(gridColumnCount, gridRowCount);
+  drawCellLabels(gridColumnCount, gridRowCount);
+
+  for (let particleIndex = 0; particleIndex < particlePositions.length; particleIndex++) {
+    drawParticle(particleIndex, gridColumnCount, gridRowCount);
+  }
+
+  drawHoveredCellBorder(gridColumnCount);
+  updateStartIndexPanelHighlights(gridColumnCount);
+
+  requestAnimationFrame(draw);
+}
+
+// --- Event handlers ---
+
+gridCanvas.addEventListener('mousemove', event => {
+  const canvasBounds = gridCanvas.getBoundingClientRect();
+  const mouseX = event.clientX - canvasBounds.left;
+  const mouseY = event.clientY - canvasBounds.top;
+  const cellColumn = Math.floor(mouseX / cellSize);
+  const cellRow = Math.floor(mouseY / cellSize);
+  const isInsideGrid = cellColumn >= 0 && cellColumn < grid.grid_size[0]
+                    && cellRow >= 0 && cellRow < grid.grid_size[1];
+
+  hoveredCellKey = isInsideGrid ? cellRow * grid.grid_size[0] + cellColumn : null;
+});
+
+gridCanvas.addEventListener('mouseleave', () => { hoveredCellKey = null; });
+
+document.getElementById('shuffle').addEventListener('click', generateRandomParticlePositions);
+
+document.getElementById('radiusSlider').addEventListener('input', event => {
+  densityRadius = +event.target.value;
+  cellSize = densityRadius * 2;
+  document.getElementById('radiusVal').textContent = densityRadius;
+  rebuildGrid();
+});
+
+// --- Initialize ---
+
+generateRandomParticlePositions();
+draw();
+</script>
+</body>
+</html>
