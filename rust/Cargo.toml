@@ -6,6 +6,15 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "simulation_project"
+path = "src/main.rs"
+required-features = ["native"]
+
+[[bench]]
+name = "simulation"
+harness = false
+
 [features]
 default = ["native"]
 native = ["piston", "piston2d-graphics", "pistoncore-glutin_window", "piston2d-opengl_graphics", "piston_window", "image"]
